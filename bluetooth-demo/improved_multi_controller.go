@@ -5,7 +5,7 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"github.com/lmLumos/nscon"
+	"github.com/mzyy94/nscon"
 	"log"
 	"os"
 	"os/signal"
@@ -16,12 +16,14 @@ import (
 	"time"
 )
 
-// ControllerManager manages multiple Nintendo Switch controllers
+// ControllerManager manages multiple Nintendo Switch controllers with separate USB gadgets
 type ControllerManager struct {
 	controllers map[int]*nscon.Controller
 	devices     map[int]string
+	hidgDevices map[int]string
 	mutex       sync.RWMutex
 	logLevel    int
+	running     bool
 }
 
 // NewControllerManager creates a new multi-controller manager
@@ -29,7 +31,9 @@ func NewControllerManager(logLevel int) *ControllerManager {
 	return &ControllerManager{
 		controllers: make(map[int]*nscon.Controller),
 		devices:     make(map[int]string),
+		hidgDevices: make(map[int]string),
 		logLevel:    logLevel,
+		running:     true,
 	}
 }
 
@@ -46,6 +50,16 @@ func (cm *ControllerManager) AddController(playerNum int, hidgDevice string, inp
 		return fmt.Errorf("controller %d already exists", playerNum)
 	}
 
+	// Verify hidg device exists
+	if _, err := os.Stat(hidgDevice); os.IsNotExist(err) {
+		return fmt.Errorf("hidg device %s does not exist", hidgDevice)
+	}
+
+	// Verify input device exists
+	if _, err := os.Stat(inputDevice); os.IsNotExist(err) {
+		return fmt.Errorf("input device %s does not exist", inputDevice)
+	}
+
 	// Create new Nintendo Switch controller
 	controller := nscon.NewController(hidgDevice)
 	controller.LogLevel = cm.logLevel
@@ -53,11 +67,12 @@ func (cm *ControllerManager) AddController(playerNum int, hidgDevice string, inp
 	// Connect to the Nintendo Switch
 	err := controller.Connect()
 	if err != nil {
-		return fmt.Errorf("failed to connect controller %d: %v", playerNum, err)
+		return fmt.Errorf("failed to connect controller %d to %s: %v", playerNum, hidgDevice, err)
 	}
 
 	cm.controllers[playerNum] = controller
 	cm.devices[playerNum] = inputDevice
+	cm.hidgDevices[playerNum] = hidgDevice
 
 	log.Printf("Controller %d connected: %s -> %s", playerNum, inputDevice, hidgDevice)
 
@@ -76,6 +91,7 @@ func (cm *ControllerManager) RemoveController(playerNum int) {
 		controller.Close()
 		delete(cm.controllers, playerNum)
 		delete(cm.devices, playerNum)
+		delete(cm.hidgDevices, playerNum)
 		log.Printf("Controller %d disconnected", playerNum)
 	}
 }
@@ -85,13 +101,16 @@ func (cm *ControllerManager) Close() {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
 
+	cm.running = false
+
 	for playerNum, controller := range cm.controllers {
 		controller.Close()
 		log.Printf("Controller %d closed", playerNum)
 	}
-	
+
 	cm.controllers = make(map[int]*nscon.Controller)
 	cm.devices = make(map[int]string)
+	cm.hidgDevices = make(map[int]string)
 }
 
 // ListControllers returns a list of active controllers
@@ -120,19 +139,26 @@ func (cm *ControllerManager) readControllerInput(playerNum int, devicePath strin
 	eventSize := 24
 	buffer := make([]byte, eventSize)
 
-	for {
+	for cm.running {
 		// Check if controller still exists
 		cm.mutex.RLock()
 		_, exists := cm.controllers[playerNum]
 		cm.mutex.RUnlock()
-		
+
 		if !exists {
 			log.Printf("Controller %d: Stopping input reader", playerNum)
 			return
 		}
 
+		// Set read timeout to allow for clean shutdown
+		file.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+
 		n, err := file.Read(buffer)
 		if err != nil {
+			// Check if it's a timeout error (expected for clean shutdown)
+			if strings.Contains(err.Error(), "timeout") {
+				continue
+			}
 			log.Printf("Controller %d: Error reading from device: %v", playerNum, err)
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -165,13 +191,13 @@ func (cm *ControllerManager) handleInputEvent(playerNum int, eventType uint16, c
 
 		switch code {
 		case 304: // BTN_SOUTH (A)
-			setInput(&con.Input.Button.B, pressed)
-		case 305: // BTN_EAST (B)
 			setInput(&con.Input.Button.A, pressed)
+		case 305: // BTN_EAST (B)
+			setInput(&con.Input.Button.B, pressed)
 		case 307: // BTN_NORTH (Y)
-			setInput(&con.Input.Button.X, pressed)
-		case 308: // BTN_WEST (X)
 			setInput(&con.Input.Button.Y, pressed)
+		case 308: // BTN_WEST (X)
+			setInput(&con.Input.Button.X, pressed)
 		case 310: // BTN_TL (L)
 			setInput(&con.Input.Button.L, pressed)
 		case 311: // BTN_TR (R)
@@ -192,18 +218,31 @@ func (cm *ControllerManager) handleInputEvent(playerNum int, eventType uint16, c
 			con.Input.Stick.Right.Press = uint8(value)
 		}
 
+		if cm.logLevel > 2 {
+			log.Printf("Controller %d: Button event - Code: %d, Pressed: %t", playerNum, code, pressed)
+		}
 
 	case EV_ABS:
 		// Debug output to see raw values
+		if cm.logLevel > 2 {
+			log.Printf("Controller %d: Axis event - Code: %d, Raw Value: %d", playerNum, code, value)
+		}
 
-		// Normalize axis values for 8-bit controllers (0-255 range)
+		// Normalize axis values for different controller types
 		var normalizedValue float64
 
+		// Handle different controller ranges
 		if value >= 0 && value <= 255 {
+			// 8-bit unsigned range (0-255)
 			normalizedValue = (float64(value) - 127.5) / 127.5
 		} else if value >= -32768 && value <= 32767 {
+			// 16-bit signed range (-32768 to 32767)
 			normalizedValue = float64(value) / 32767.0
+		} else if value >= 0 && value <= 4095 {
+			// 12-bit unsigned range
+			normalizedValue = (float64(value) - 2048.0) / 2048.0
 		} else {
+			// Fallback to 8-bit unsigned
 			normalizedValue = (float64(value) - 127.5) / 127.5
 		}
 
@@ -263,22 +302,23 @@ func setInput(input *uint8, pressed bool) {
 }
 
 // findInputDevices automatically detects connected controllers
-func findInputDevices() map[int]string {
-	devices := make(map[int]string)
+func findInputDevices() map[string]string {
+	devices := make(map[string]string)
 
-	for i := 0; i < 10; i++ {
+	// Check event devices
+	for i := 0; i < 20; i++ {
 		path := fmt.Sprintf("/dev/input/event%d", i)
 		if _, err := os.Stat(path); err == nil {
-			// Check the sysfs "name" file for this event device
+			// Try to get device name from sysfs
 			namePath := fmt.Sprintf("/sys/class/input/event%d/device/name", i)
-			nameBytes, err := os.ReadFile(namePath)
-			if err != nil {
-				continue
-			}
-
-			name := strings.TrimSpace(string(nameBytes))
-			if name == "Wireless Controller" {
-				devices[len(devices)+1] = path
+			if nameBytes, err := os.ReadFile(namePath); err == nil {
+				name := strings.TrimSpace(string(nameBytes))
+				// Look for common controller names
+				if isControllerDevice(name) {
+					key := fmt.Sprintf("%s%d", name, i)
+					devices[key] = path
+					log.Printf("Found controller: %s at %s", key, path)
+				}
 			}
 		}
 	}
@@ -286,43 +326,148 @@ func findInputDevices() map[int]string {
 	return devices
 }
 
-// setupUSBGadgets creates the necessary USB gadget devices
-func setupUSBGadgets(numControllers int) []string {
-	var hidgDevices []string
-	
-	log.Println("Setting up USB gadgets...")
-	log.Printf("You need to create %d USB gadget devices:", numControllers)
-	
-	for i := 0; i < numControllers; i++ {
-		hidgPath := fmt.Sprintf("/dev/hidg%d", i)
-		hidgDevices = append(hidgDevices, hidgPath)
-		
-		log.Printf("  %d. Create %s using the USB gadget script", i+1, hidgPath)
-		log.Printf("     Example: sudo ./add_procon_gadget.sh %d", i)
+// isControllerDevice checks if a device name indicates a game controller
+func isControllerDevice(name string) bool {
+	controllerNames := []string{
+		"Wireless Controller",
+		"Xbox",
+		"PlayStation",
+		"PS3",
+		"PS4",
+		"PS5",
+		"DualShock",
+		"DualSense",
+		"Pro Controller",
+		"Joy-Con",
+		"8Bitdo",
+		"Nintendo",
+		"Gamepad",
 	}
+
+	nameLower := strings.ToLower(name)
+	for _, controllerName := range controllerNames {
+		if nameLower== strings.ToLower(controllerName) {
+			return true
+		}
+	}
+	return false
+}
+
+// findHidgDevices finds available hidg devices
+func findHidgDevices() []string {
+	var devices []string
+	for i := 0; i < 8; i++ {
+		path := fmt.Sprintf("/dev/hidg%d", i)
+		if _, err := os.Stat(path); err == nil {
+			devices = append(devices, path)
+		}
+	}
+	return devices
+}
+
+// setupControllerMapping provides interactive controller setup
+func setupControllerMapping(manager *ControllerManager) {
+	fmt.Println("\n=== Controller Mapping Setup ===")
 	
-	log.Println()
-	log.Println("Make sure all USB gadget devices exist before continuing!")
+	inputDevices := findInputDevices()
+	hidgDevices := findHidgDevices()
+
+	if len(inputDevices) == 0 {
+		fmt.Println("❌ No input controllers found!")
+		fmt.Println("Make sure your controllers are connected and recognized by the system.")
+		fmt.Println("Use 'sudo evtest' to verify controller detection.")
+		return
+	}
+
+	if len(hidgDevices) == 0 {
+		fmt.Println("❌ No hidg devices found!")
+		fmt.Println("Make sure USB gadgets are set up correctly.")
+		fmt.Println("Run the setup script: sudo ./setup_separate_procon_gadgets.sh")
+		return
+	}
+
+	fmt.Printf("Found %d input device(s) and %d hidg device(s)\n", len(inputDevices), len(hidgDevices))
 	
-	return hidgDevices
+	fmt.Println("\nAvailable input controllers:")
+	inputList := make([]string, 0, len(inputDevices))
+	for name, path := range inputDevices {
+		fmt.Printf("  %s -> %s\n", name, path)
+		inputList = append(inputList, path)
+	}
+
+	fmt.Println("\nAvailable hidg devices:")
+	for i, device := range hidgDevices {
+		fmt.Printf("  %d: %s\n", i+1, device)
+	}
+
+	// Interactive mapping
+	scanner := bufio.NewScanner(os.Stdin)
+	playerNum := 1
+
+	for len(inputList) > 0 && playerNum <= len(hidgDevices) {
+		fmt.Printf("\nController %d setup:\n", playerNum)
+		
+		// Select input device
+		fmt.Printf("Select input device (1-%d, or 'skip'): ", len(inputList))
+		scanner.Scan()
+		choice := strings.TrimSpace(scanner.Text())
+		
+		if choice == "skip" {
+			break
+		}
+
+		inputIndex, err := strconv.Atoi(choice)
+		if err != nil || inputIndex < 1 || inputIndex > len(inputList) {
+			fmt.Println("Invalid selection!")
+			continue
+		}
+
+		inputDevice := inputList[inputIndex-1]
+		hidgDevice := hidgDevices[playerNum-1]
+
+		fmt.Printf("Mapping: Player %d = %s -> %s\n", playerNum, inputDevice, hidgDevice)
+		
+		err = manager.AddController(playerNum, hidgDevice, inputDevice)
+		if err != nil {
+			fmt.Printf("❌ Failed to add controller %d: %v\n", playerNum, err)
+			continue
+		}
+
+		// Remove selected device from list
+		inputList = append(inputList[:inputIndex-1], inputList[inputIndex:]...)
+		playerNum++
+	}
+
+	if len(manager.ListControllers()) == 0 {
+		fmt.Println("❌ No controllers were successfully configured!")
+		return
+	}
+
+	fmt.Printf("\n✅ Successfully configured %d controller(s)!\n", len(manager.ListControllers()))
 }
 
 func printUsage() {
 	fmt.Println("Multi-Controller Nintendo Switch Controller Simulator")
+	fmt.Println("Supports separate USB gadgets for true multi-controller functionality")
 	fmt.Println("")
 	fmt.Println("Usage:")
-	fmt.Println("  sudo go run multi_controller.go [options]")
+	fmt.Println("  sudo go run improved_multi_controller.go [options]")
 	fmt.Println("")
 	fmt.Println("Options:")
-	fmt.Println("  --auto          Auto-detect controllers")
-	fmt.Println("  --manual        Manual controller setup")
+	fmt.Println("  --auto          Auto-detect and map controllers")
+	fmt.Println("  --interactive   Interactive controller setup (default)")
+	fmt.Println("  --manual        Manual controller configuration")
 	fmt.Println("  --debug         Enable debug logging")
 	fmt.Println("  --help, -h      Show this help")
 	fmt.Println("")
+	fmt.Println("Prerequisites:")
+	fmt.Println("  1. Run sudo ./setup_separate_procon_gadgets.sh [num_controllers]")
+	fmt.Println("  2. Connect your Bluetooth/USB controllers")
+	fmt.Println("  3. Verify with 'sudo evtest' that controllers are detected")
+	fmt.Println("")
 	fmt.Println("Examples:")
-	fmt.Println("  sudo go run multi_controller.go --auto")
-	fmt.Println("  sudo go run multi_controller.go --manual")
-	fmt.Println("  sudo go run multi_controller.go --debug --auto")
+	fmt.Println("  sudo go run improved_multi_controller.go --interactive")
+	fmt.Println("  sudo go run improved_multi_controller.go --debug --auto")
 }
 
 func main() {
@@ -340,72 +485,56 @@ func main() {
 		switch arg {
 		case "--auto":
 			autoMode = true
+		case "--interactive":
+			// Interactive is default, no need to set flag
 		case "--manual":
 			manualMode = true
+			autoMode = false
 		case "--debug":
 			debugMode = true
 		}
 	}
 
-	// Default to auto mode if nothing specified
-	if !autoMode && !manualMode {
-		autoMode = true
-	}
-
 	logLevel := 1
 	if debugMode {
 		logLevel = 3
+		log.Println("Debug mode enabled")
 	}
 
 	// Create controller manager
 	manager := NewControllerManager(logLevel)
 	defer manager.Close()
 
+	fmt.Println("🎮 Multi-Controller Nintendo Switch Simulator")
+	fmt.Println("Using separate USB gadgets for true multi-controller support")
+	fmt.Println()
+
 	if autoMode {
 		// Auto-detect mode
-		log.Println("Auto-detecting controllers...")
+		fmt.Println("🔍 Auto-detecting controllers...")
 		
 		inputDevices := findInputDevices()
-		time.Sleep(5 * time.Second)
+		hidgDevices := findHidgDevices()
+
 		if len(inputDevices) == 0 {
-			log.Println("No input devices found!")
-			log.Println("Make sure your controllers are connected.")
-		time.Sleep(5 * time.Second)
+			fmt.Println("❌ No controllers found!")
+			return
 		}
-		if len(inputDevices) == 0 {
-                        log.Println("No input devices found!")
-                        log.Println("Make sure your controllers are connected.")
-                        time.Sleep(5 * time.Second)
-                }
-		if len(inputDevices) == 0 {
-                        log.Println("No input devices found!")
-                        log.Println("Make sure your controllers are connected.")
-                        time.Sleep(5 * time.Second)
-                }
-		if len(inputDevices) == 0 {
-                        log.Println("No input devices found!")
-                        log.Println("Make sure your controllers are connected.")
-                        return
-                }
 
+		if len(hidgDevices) == 0 {
+			fmt.Println("❌ No hidg devices found! Run setup script first.")
+			return
+		}
 
-		log.Printf("Found %d potential input device(s)", len(inputDevices))
-		
-		// Setup USB gadgets
-		hidgDevices := setupUSBGadgets(len(inputDevices))
-		
-		// Wait for user to set up USB gadgets
-		fmt.Print("Press Enter when all USB gadgets are created...")
-		bufio.NewReader(os.Stdin).ReadBytes('\n')
-
-		// Add controllers
+		// Auto-map controllers
 		playerNum := 1
 		for _, inputDevice := range inputDevices {
 			if playerNum > len(hidgDevices) {
 				break
 			}
 			
-			err := manager.AddController(playerNum, hidgDevices[playerNum-1], inputDevice)
+			hidgDevice := hidgDevices[playerNum-1]
+			err := manager.AddController(playerNum, hidgDevice, inputDevice)
 			if err != nil {
 				log.Printf("Failed to add controller %d: %v", playerNum, err)
 			} else {
@@ -413,12 +542,12 @@ func main() {
 			}
 		}
 
-	} else {
+	} else if manualMode {
 		// Manual mode
-		log.Println("Manual controller setup mode")
-		log.Println("Enter controller configurations (player:input_device:hidg_device)")
-		log.Println("Example: 1:/dev/input/event2:/dev/hidg0")
-		log.Println("Enter 'done' when finished")
+		fmt.Println("📝 Manual controller setup")
+		fmt.Println("Enter controller configurations (player:input_device:hidg_device)")
+		fmt.Println("Example: 1:/dev/input/event2:/dev/hidg0")
+		fmt.Println("Enter 'done' when finished")
 
 		scanner := bufio.NewScanner(os.Stdin)
 		for {
@@ -434,13 +563,13 @@ func main() {
 
 			parts := strings.Split(line, ":")
 			if len(parts) != 3 {
-				log.Println("Invalid format. Use: player:input_device:hidg_device")
+				fmt.Println("Invalid format. Use: player:input_device:hidg_device")
 				continue
 			}
 
 			playerNum, err := strconv.Atoi(parts[0])
 			if err != nil {
-				log.Printf("Invalid player number: %s", parts[0])
+				fmt.Printf("Invalid player number: %s\n", parts[0])
 				continue
 			}
 
@@ -449,25 +578,30 @@ func main() {
 
 			err = manager.AddController(playerNum, hidgDevice, inputDevice)
 			if err != nil {
-				log.Printf("Failed to add controller: %v", err)
+				fmt.Printf("Failed to add controller: %v\n", err)
 			}
 		}
+
+	} else if !autoMode && !manualMode {
+		// Interactive mode (default)
+		setupControllerMapping(manager)
 	}
 
 	// Show active controllers
 	controllers := manager.ListControllers()
 	if len(controllers) == 0 {
-		log.Println("No controllers active. Exiting...")
+		fmt.Println("❌ No controllers active. Exiting...")
 		return
 	}
 
-	log.Printf("Active controllers: %v", controllers)
-	log.Println("All controllers are ready! Press Ctrl+C to exit.")
+	fmt.Printf("✅ Active controllers: %v\n", controllers)
+	fmt.Println("🔌 Connect your Nintendo Switch via USB cable")
+	fmt.Println("🎮 Controllers are ready! Press Ctrl+C to exit.")
 
 	// Wait for interrupt signal
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
 	<-c
-	log.Println("Shutting down all controllers...")
+	fmt.Println("\n🛑 Shutting down all controllers...")
 }

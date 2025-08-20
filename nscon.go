@@ -178,15 +178,6 @@ func (c *Controller) uart(ack bool, subCmd byte, data []byte) {
 func (c *Controller) write(ack byte, cmd byte, buf []byte) {
 	data := append(append([]byte{ack, cmd}, buf...), make([]byte, 62-len(buf))...)
 	c.fp.Write(data)
-	if c.LogLevel > 0 {
-		if ack == 0x30 {
-			if c.LogLevel > 2 {
-				log.Println("write:", hex.EncodeToString(data))
-			}
-		} else {
-			log.Println("write:", hex.EncodeToString(data))
-		}
-	}
 }
 
 // Connect begins connection to device
@@ -222,9 +213,6 @@ func (c *Controller) Connect() error {
 			}
 
 			n, err := c.fp.Read(buf)
-			if c.LogLevel > 0 {
-				log.Println("read:", hex.EncodeToString(buf[:n]), err)
-			}
 			switch buf[0] {
 			case 0x80:
 				switch buf[1] {
