@@ -394,10 +394,6 @@ func main() {
 		// Setup USB gadgets
 		hidgDevices := setupUSBGadgets(len(inputDevices))
 		
-		// Wait for user to set up USB gadgets
-		fmt.Print("Press Enter when all USB gadgets are created...")
-		bufio.NewReader(os.Stdin).ReadBytes('\n')
-
 		// Add controllers
 		playerNum := 1
 		for _, inputDevice := range inputDevices {

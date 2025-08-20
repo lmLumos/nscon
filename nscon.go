@@ -3,7 +3,6 @@
 package nscon
 
 import (
-	"encoding/hex"
 	"errors"
 	"log"
 	"math"
@@ -212,7 +211,6 @@ func (c *Controller) Connect() error {
 			default:
 			}
 
-			n, err := c.fp.Read(buf)
 			switch buf[0] {
 			case 0x80:
 				switch buf[1] {
