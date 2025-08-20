@@ -5,7 +5,7 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"github.com/mzyy94/nscon"
+	"github.com/lmLumos/nscon"
 	"log"
 	"os"
 	"os/signal"
